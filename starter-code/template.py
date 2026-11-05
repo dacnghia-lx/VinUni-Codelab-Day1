@@ -65,9 +65,25 @@ def call_openai(
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         # response.usage contains input_tokens and output_tokens (prompt_tokens/completion_tokens)
     """
-    # TODO: Import OpenAI, instantiate client, call chat.completions.create with parameters,
-    #       measure execution start/end time, extract text and token usage, and return them.
-    raise NotImplementedError("Implement call_openai")
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    start = time.time()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+    )
+    latency = time.time() - start
+
+    usage = {
+        "input_tokens": response.usage.prompt_tokens,
+        "output_tokens": response.usage.completion_tokens,
+    }
+    return response.choices[0].message.content or "", latency, usage
 
 
 # ---------------------------------------------------------------------------
@@ -113,9 +129,37 @@ def call_gemini(
         Ensure your usage dictionary extracts 'input_tokens' and 'output_tokens' 
         from the response metadata (e.g. response.usage_metadata).
     """
-    # TODO: Initialize Gemini client, set config parameters, call generate_content,
-    #       measure latency, extract response text and usage metadata, and return the tuple.
-    raise NotImplementedError("Implement call_gemini")
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    # "Thinking" tokens count against max_output_tokens; keep thinking minimal so
+    # a small budget (256) is not consumed before any visible text is produced.
+    # Gemini 2.5 uses thinking_budget, Gemini 3+ uses thinking_level.
+    if model.startswith("gemini-2.5"):
+        thinking = types.ThinkingConfig(thinking_budget=0)
+    else:
+        thinking = types.ThinkingConfig(thinking_level="low")
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        top_p=top_p,
+        max_output_tokens=max_tokens,
+        thinking_config=thinking,
+    )
+
+    start = time.time()
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=config,
+    )
+    latency = time.time() - start
+
+    usage = {
+        "input_tokens": response.usage_metadata.prompt_token_count,
+        "output_tokens": response.usage_metadata.candidates_token_count,
+    }
+    return response.text or "", latency, usage
 
 
 # ---------------------------------------------------------------------------
@@ -188,10 +232,10 @@ def compare_models(prompt: str) -> dict:
 # ---------------------------------------------------------------------------
 def streaming_chatbot() -> None:
     """
-    Run an interactive streaming chatbot in the terminal using Gemini 2.5.
+    Run an interactive streaming chatbot in the terminal using OpenAI.
 
     Behaviour:
-        - Streams response tokens from Gemini 2.5 Flash as they arrive.
+        - Streams response tokens from OpenAI (gpt-4o-mini) as they arrive.
         - Maintains the last 3 turns of conversation history for context.
         - Typing 'quit' or 'exit' ends the session.
 
@@ -200,8 +244,48 @@ def streaming_chatbot() -> None:
         - Check how to stream responses using client.chats or model.generate_content(..., stream=True).
         - Keep history limited to the last 3 turns to optimize context window and costs.
     """
-    # TODO: Setup interactive session, prompt user for input, stream response, and update history.
-    raise NotImplementedError("Implement streaming_chatbot")
+    from openai import OpenAI
+
+    client = None
+    history: list[dict] = []
+
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if user_input.lower() in ("quit", "exit"):
+            break
+        if not user_input:
+            continue
+
+        history.append({"role": "user", "content": user_input})
+        try:
+            # Create the client lazily so typing 'quit' right away needs no API key.
+            if client is None:
+                client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            stream = client.chat.completions.create(
+                model=OPENAI_MINI_MODEL,
+                messages=history,
+                stream=True,
+            )
+            print("Bot: ", end="", flush=True)
+            reply = ""
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    piece = chunk.choices[0].delta.content
+                    print(piece, end="", flush=True)
+                    reply += piece
+            print()
+        except Exception as e:
+            print(f"\n[Error] {e}")
+            history.pop()  # drop the unanswered user message
+            continue
+
+        history.append({"role": "assistant", "content": reply})
+        # Keep only the last 3 turns (3 user + 3 assistant messages)
+        history = history[-6:]
 
 
 # ---------------------------------------------------------------------------
@@ -227,8 +311,15 @@ def retry_with_backoff(
     Raises:
         The last exception raised by fn() after all retries are exhausted.
     """
-    # TODO: implement retry loop with exponential backoff
-    raise NotImplementedError("Implement retry_with_backoff")
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            delay = base_delay * 2**attempt
+            print(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.1f}s...")
+            time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +362,10 @@ def format_comparison_table(results: list[dict]) -> str:
 # Entry point for manual testing
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
     print("=== Model Comparison Test ===")
     test_prompt = "Hãy giải thích sự khác biệt giữa temperature và top_p bằng tiếng Việt ngắn gọn trong 2 câu."
     try:
@@ -285,7 +380,7 @@ if __name__ == "__main__":
         print(f"Skipping live API comparison test: {e}")
         print("Set your API keys to run manual tests.")
 
-    print("\n=== Starting Gemini 2.5 Chatbot (type 'quit' to exit) ===")
+    print(f"\n=== Starting OpenAI Chatbot ({OPENAI_MINI_MODEL}, type 'quit' to exit) ===")
     try:
         streaming_chatbot()
     except Exception as e:
